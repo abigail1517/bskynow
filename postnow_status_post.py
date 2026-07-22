@@ -280,39 +280,6 @@ def _claim_account_row(service, data_idx, repo_idx, status_idx, at_idx):
 # ═══════════════════════════════════════════════════════════════════════════
 #  ACCOUNT CONFIG + LIVE SETTINGS — from Sheet1, row ACCOUNT_ROW.
 # ═══════════════════════════════════════════════════════════════════════════
-#
-#  Expected Sheet1 header (case-insensitive), per-account identity:
-#
-#  BSKY_HANDLE | BSKY_APP_PW | LINK_URL | LINK_DISPLAY_TEXT | HASHTAGS |
-#  MEGA_UPLOAD_FOLDER | MEGA_PROCESSED_FOLDER |
-#  LOCKED_BY | LOCKED_AT   (optional) |
-#  ACCOUNT_STATUS | ACCOUNT_STATUS_AT   (optional) |
-#  ASSIGNED_REPO | ASSIGNED_STATUS | ASSIGNED_AT   (optional) |
-#  POST_PLAN_SHEET_NAME  (optional) | LINK_PLAN_SHEET_NAME  (optional)
-#
-#  Any of the "live settings" below can ALSO be set per-row in Sheet1 (as an
-#  extra column with the same name) to override the shared Settings tab
-#  value for just that one account:
-#
-#  IMAGE_RATIO | VIDEO_RATIO | LINK_RATIO |
-#  HASHTAGS_ENABLED_IMAGE | HASHTAGS_ENABLED_VIDEO | HASHTAGS_ENABLED_LINK |
-#  LINK_ENABLED_IMAGE | LINK_ENABLED_VIDEO | LINK_PERCENTAGE | MAX_IMAGE_MB |
-#  CAPTION_ENABLED | AUTO_CAPTION_ENABLED_LINK | PREVIEW_FETCH_TIMEOUT |
-#  MAX_THUMB_MB | ENABLE_REPORT | REPORT_TIMES_PER_DAY | TOP_POSTS_COUNT |
-#  TOP_POSTS_WITHIN | POST_PLAN_SHEET_NAME | LINK_PLAN_SHEET_NAME |
-#  LOOP_INTERVAL_SECONDS
-#
-#  NOTE on LINK_RATIO: it defaults to 0 (previewLink posting OFF) so that
-#  existing sheets with only IMAGE_RATIO/VIDEO_RATIO set keep behaving
-#  exactly as before. Set LINK_RATIO to a number > 0 in the Settings tab
-#  (or per-row in Sheet1) to start mixing previewLink posts in — e.g.
-#  IMAGE_RATIO=50, VIDEO_RATIO=30, LINK_RATIO=20 gives a 50/30/20 split.
-#  The three values are normalized together, so they don't need to add to
-#  100 exactly.
-#
-#  NOTE on MAX_ACCOUNTS_PER_RUN: this is read by run_discover() (the
-#  workflow's matrix-building step, invoked via `--discover`), not by the
-#  posting loop below.
 
 _account_config         = None
 _creds_lock_col_by      = None
@@ -1509,12 +1476,22 @@ def post_to_bluesky(client, media_name, local_path, kind, caption, tags, add_lin
 # ═══════════════════════════════════════════════════════════════════════════
 #  DISCOVER MODE (`python postnow_status_post.py --discover`)
 #
-#  Runs once, in the workflow's 'prepare' job — merged in from the old
-#  standalone discover_accounts.py so there's only ONE script in the repo.
-#  Reads the Credentials tab, drops empty/banned/suspended rows, applies
-#  the optional MAX_ACCOUNTS_PER_RUN cap (or FORCE_ACCOUNT_ROW override),
-#  and writes a JSON matrix + count to $GITHUB_OUTPUT so the 'post' job can
-#  fan out one job per eligible account row.
+#  Runs once, in the workflow's 'discover-accounts' job — merged in from
+#  the old standalone discover_accounts.py so there's only ONE script in
+#  the repo. Reads the Credentials tab, drops empty/banned/suspended rows,
+#  applies the optional MAX_ACCOUNTS_PER_RUN cap (or FORCE_ACCOUNT_ROW
+#  override), and writes a plain comma-separated row list + count to
+#  $GITHUB_OUTPUT so the 'post' job can fan out one job per eligible
+#  account row.
+#
+#  IMPORTANT: we write a plain CSV string ("1,2,3,4"), NOT a JSON-shaped
+#  string ("{\"account_row\": [1, 2, 3, 4]}"). GitHub Actions runs an
+#  automatic secret-scanner on every step output and will silently blank
+#  the ENTIRE output ("Skip output 'matrix' since it may contain secret")
+#  if the text happens to overlap a registered secret value — which can
+#  trigger by pure coincidence on a JSON string full of braces/quotes/
+#  digits. The workflow yaml rebuilds the JSON array from this CSV string
+#  via fromJson(format('[{0}]', ...)) instead.
 # ═══════════════════════════════════════════════════════════════════════════
 
 def run_discover():
@@ -1590,13 +1567,13 @@ def run_discover():
             print("MAX_ACCOUNTS_PER_RUN not set — running all eligible accounts.")
 
     print(f"Account rows for this workflow run: {eligible}")
-    matrix = {"account_row": eligible}
+    rows_csv = ",".join(str(r) for r in eligible)
 
     gh_output = os.environ.get("GITHUB_OUTPUT")
     if not gh_output:
         raise RuntimeError("GITHUB_OUTPUT is not set — must be run inside a GitHub Actions step.")
     with open(gh_output, "a") as f:
-        f.write(f"matrix={json.dumps(matrix)}\n")
+        f.write(f"rows={rows_csv}\n")
         f.write(f"count={len(eligible)}\n")
 
 
