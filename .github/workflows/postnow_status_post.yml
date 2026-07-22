@@ -53,9 +53,12 @@ jobs:
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
 
+      # NOTE: discover_accounts.py was merged into postnow_status_post.py
+      # (invoked via the --discover flag) so there's only one script in
+      # the repo. This step now calls that instead of a separate file.
       - name: Discover eligible accounts
         id: discover
-        run: python -u discover_accounts.py
+        run: python -u postnow_status_post.py --discover
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_APPLICATION_CREDENTIALS: google_creds.json
@@ -125,5 +128,5 @@ jobs:
       # take every account offline because one of them got banned. Instead,
       # postnow_status_post.py already writes ACCOUNT_STATUS on the sheet
       # row when an account is banned/suspended/auth-fails, and
-      # discover_accounts.py automatically excludes that row from future
-      # runs. No workflow-level disable needed.
+      # run_discover() (via --discover) automatically excludes that row
+      # from future runs. No workflow-level disable needed.
