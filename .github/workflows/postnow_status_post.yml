@@ -36,8 +36,8 @@ jobs:
   discover-accounts:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.discover.outputs.matrix }}
-      count:  ${{ steps.discover.outputs.count }}
+      rows:  ${{ steps.discover.outputs.rows }}
+      count: ${{ steps.discover.outputs.count }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v4
@@ -81,7 +81,10 @@ jobs:
     strategy:
       fail-fast: false          # one account failing shouldn't cancel the rest
       matrix:
-        account_row: ${{ fromJson(needs.discover-accounts.outputs.matrix).account_row }}
+        # 'rows' is a plain comma-separated string like "1,2,3,4" (see the
+        # NOTE in postnow_status_post.py's run_discover() for why this
+        # isn't emitted as JSON directly). We rebuild the JSON array here.
+        account_row: ${{ fromJson(format('[{0}]', needs.discover-accounts.outputs.rows)) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v4
