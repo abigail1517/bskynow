@@ -43,8 +43,11 @@ jobs:
       - uses: actions/setup-python@v4
         with:
           python-version: "3.11"
+      # postnow_status_post.py imports bs4/atproto/PIL/requests at module
+      # level, so even --discover mode needs the full dependency set
+      # installed, not just the Google libs.
       - name: Install dependencies
-        run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
+        run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib atproto Pillow requests beautifulsoup4
 
       # Credentials are written straight from the secret — never fetched
       # from a public URL, never committed to the repo.
