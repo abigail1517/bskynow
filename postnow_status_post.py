@@ -62,6 +62,28 @@ around minimizing call *count*, not just being polite about it:
      catches it, logs it, and sleeps until the next cycle. The account
      keeps trying every loop_interval instead of the job exiting.
 
+PROXY SUPPORT (per-account, sheet-managed)
+────────────────────────────────────────────────────
+Each Credentials row can be given its own outbound HTTP(S) proxy, pulled
+from a "Proxies" tab in the same spreadsheet. Design:
+
+  - The Proxies tab is a pool of candidate proxies (IP / Port / optional
+    ResponseTime(s) / Status), plus tracking columns this script manages:
+    ASSIGNED_TO, ASSIGNED_AT, LAST_CHECKED, LAST_CHECK_OK.
+  - An account keeps the SAME proxy across cycles once assigned (persisted
+    in Credentials via PROXY_IP / PROXY_PORT / PROXY_ASSIGNED_AT) — it does
+    NOT reshuffle every cycle.
+  - Every cycle, before login, the currently-assigned proxy (if any) is
+    re-checked for liveness. If it's dead, it's marked "dead" in the
+    Proxies tab (so nobody else picks it) and released from the account;
+    a new, not-yet-used proxy is then claimed.
+  - Claiming a fresh proxy is optimistic-locked the same way LinkPlan rows
+    are (re-read the Status cell right before writing "assigned" to narrow
+    the race between two account jobs grabbing the same proxy).
+  - A dead proxy is marked "dead" and never handed out again; a proxy that
+    was released back to the pool (e.g. its account got banned) goes back
+    to "" (free) so it can be reused elsewhere.
+
 CALL-SITE CONVENTION FOR sheets_call()
 ────────────────────────────────────────
 `sheets_call()` takes a zero-argument callable (`request_factory`) and
@@ -95,6 +117,7 @@ import requests
 from bs4 import BeautifulSoup
 from atproto import Client, models
 from atproto_client.utils import TextBuilder
+from atproto_client.request import Request as AtprotoRequest
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -171,6 +194,7 @@ RCLONE_REMOTE_NAME = get_env("RCLONE_REMOTE_NAME", required=False) or "mega"
 CREDS_TAB    = "Credentials"
 SETTINGS_TAB = "Settings"
 REPORT_TAB   = "Report"
+PROXIES_TAB  = "Proxies"
 
 SKIP_STATUS_MARKERS = ("banned", "suspended", "taken down", "auth failed")
 
@@ -183,7 +207,21 @@ CREDENTIALS_HEADER = [
     "LOCKED_BY", "LOCKED_AT",
     "ACCOUNT_STATUS", "ACCOUNT_STATUS_AT",
     "ASSIGNED_REPO", "ASSIGNED_STATUS", "ASSIGNED_AT",
+    "PROXY_IP", "PROXY_PORT", "PROXY_ASSIGNED_AT",
 ]
+
+# Base columns for a brand-new Proxies tab (only used if the tab doesn't
+# exist yet at all). If you already created the tab yourself (as in this
+# setup), ensure_extra_columns() below will just append the tracking
+# columns it needs onto the end of your existing header — it never
+# touches your existing IP/Port/ResponseTime/Status data.
+PROXIES_BASE_HEADER = ["IP", "Port", "ResponseTime(s)", "Status"]
+# Tracking columns this script owns and manages automatically. "Status" is
+# included here (not just in PROXIES_BASE_HEADER) so it gets re-added if
+# it's ever missing/deleted from an existing tab — without it there's no
+# single authoritative "assigned"/"dead" field, which is what let dead
+# proxies get reused instead of permanently skipped.
+PROXY_TRACKING_COLUMNS = ["Status", "ASSIGNED_TO", "ASSIGNED_AT", "LAST_CHECKED", "LAST_CHECK_OK"]
 
 DEFAULT_SETTINGS = [
     ("IMAGE_RATIO", "0.60"),
@@ -208,6 +246,9 @@ DEFAULT_SETTINGS = [
     ("LINK_PLAN_SHEET_NAME", "LinkPlan"),
     ("LOOP_INTERVAL_SECONDS", "1800"),
     ("MAX_ACCOUNTS_PER_RUN", ""),
+    ("USE_PROXY", "true"),
+    ("PROXY_REQUIRED", "true"),
+    ("PROXY_CHECK_TIMEOUT_SECONDS", "10"),
 ]
 
 POSTED_STATUS_VALUE = "posted"
@@ -230,6 +271,9 @@ LINK_PREVIEW_MAX_RETRIES = 3
 LINK_PREVIEW_RETRY_DELAY = 2
 
 DEFAULT_LOOP_INTERVAL_SECONDS = 1800
+
+# Used to test whether a proxy is actually usable for talking to Bluesky.
+PROXY_CHECK_URL = "https://bsky.social/xrpc/com.atproto.server.describeServer"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -474,28 +518,73 @@ REQUIRED_TABS = {
     CREDS_TAB:    CREDENTIALS_HEADER,
     SETTINGS_TAB: ["KEY", "VALUE"],
     REPORT_TAB:   REPORT_HEADER,
+    PROXIES_TAB:  PROXIES_BASE_HEADER,
 }
 
 
 def ensure_required_tabs():
-    """One-time (per job start) check that Credentials/Settings/Report tabs
-    and their headers exist. Uses at most 1 read + 1 batchUpdate (structure)
-    + 1 batchUpdate (headers) — never repeated mid-loop."""
+    """One-time (per job start) check that Credentials/Settings/Report/
+    Proxies tabs and their headers exist.
+
+    Matching against existing tab titles is done case-/whitespace-
+    insensitively, because Google Sheets itself treats names like
+    "Proxies" and "Proxies " (or different casing) as colliding when you
+    try to create one — so an exact-match check can miss a tab that's
+    really already there and then blow up trying to "create" it.
+
+    Tabs are created one at a time (not as a single multi-request
+    batchUpdate) and any "already exists" error is treated as a harmless
+    no-op rather than a crash, since Sheets batchUpdate requests are
+    all-or-nothing: one bad addSheet in a combined call would otherwise
+    block every other tab in the same call from being created too."""
     existing = sheets_existing_titles()
-    add_requests, header_writes = [], []
+    existing_norm = {str(t).strip().lower() for t in existing}
+
+    header_writes = []
     for tab, header in REQUIRED_TABS.items():
-        if tab not in existing:
-            add_requests.append({"addSheet": {"properties": {"title": tab}}})
-            header_writes.append({"range": qrange(tab, "A1"), "values": [header]})
-    if add_requests:
-        sheets_call(
-            lambda: _sheets.batchUpdate(
-                spreadsheetId=GOOGLE_SHEET_ID, body={"requests": add_requests}
+        if tab.strip().lower() in existing_norm:
+            continue
+        try:
+            sheets_call(
+                lambda t=tab: _sheets.batchUpdate(
+                    spreadsheetId=GOOGLE_SHEET_ID,
+                    body={"requests": [{"addSheet": {"properties": {"title": t}}}]},
+                )
             )
-        )
-        print(f"Created missing tab(s): {[r['addSheet']['properties']['title'] for r in add_requests]}")
+            header_writes.append({"range": qrange(tab, "A1"), "values": [header]})
+            print(f"Created missing tab: {tab}")
+        except HttpError as exc:
+            body = ""
+            try:
+                body = exc.content.decode("utf-8", "ignore") if isinstance(exc.content, bytes) else str(exc.content)
+            except Exception:
+                body = str(exc)
+            if "already exists" in body:
+                print(f"Note: tab '{tab}' already exists (under a slightly different name/case) — skipping creation.")
+            else:
+                raise
     if header_writes:
         sheets_batch_update_values(header_writes)
+
+
+def ensure_extra_columns(tab, required_headers):
+    """Append any of `required_headers` that are missing from `tab`'s
+    header row, as new trailing columns. Never touches or reorders any
+    existing columns/data — safe to call on a tab you already populated
+    yourself (e.g. a Proxies tab you built with IP/Port/ResponseTime(s)/
+    Status already in it)."""
+    res = sheets_get(qrange(tab, "1:1"))
+    rows = res.get("values", [])
+    existing_header = rows[0] if rows else []
+    existing_upper = {str(h).strip().upper() for h in existing_header if str(h).strip()}
+
+    missing = [h for h in required_headers if h.upper() not in existing_upper]
+    if not missing:
+        return
+
+    start_col = len(existing_header) + 1
+    sheets_update(qrange(tab, f"{col_letter(start_col)}1"), [missing])
+    print(f"Added missing column(s) to '{tab}': {missing}")
 
 
 def ensure_settings_defaults():
@@ -688,6 +777,14 @@ def load_account_config(force_refresh=False):
         "locked_at": col("LOCKED_AT"),
         "account_status": col("ACCOUNT_STATUS"),
         "has_lock_columns": ("LOCKED_BY" in header and "LOCKED_AT" in header),
+
+        # ── Proxy config (per-account persisted assignment + global knobs) ──
+        "use_proxy":            _parse_bool(setting("USE_PROXY"), True),
+        "proxy_required":       _parse_bool(setting("PROXY_REQUIRED"), True),
+        "proxy_check_timeout":  _parse_int(setting("PROXY_CHECK_TIMEOUT_SECONDS"), 10),
+        "proxy_ip":             col("PROXY_IP"),
+        "proxy_port":           col("PROXY_PORT"),
+        "proxy_assigned_at":    col("PROXY_ASSIGNED_AT"),
     }
 
     if not cfg["handle"]:
@@ -853,6 +950,363 @@ def _write_account_status(status):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  PROXIES (per-account assignment, persisted; live-checked every cycle)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class NoProxyAvailableError(Exception):
+    """No live, unused proxy could be found this cycle (and PROXY_REQUIRED
+    is true), or the previously-assigned proxy died and nothing else was
+    available to replace it with."""
+
+
+def _http_proxy_url(ip, port):
+    return f"http://{ip}:{port}"
+
+
+def check_proxy_alive(ip, port, timeout=10):
+    """A proxy counts as 'alive' if it can actually reach Bluesky's PDS
+    through it (not just any TCP connect) — that's the only thing that
+    matters for this workflow."""
+    proxy_url = _http_proxy_url(ip, port)
+    try:
+        resp = requests.get(
+            PROXY_CHECK_URL,
+            proxies={"http": proxy_url, "https": proxy_url},
+            timeout=timeout,
+        )
+        return resp.status_code < 500
+    except Exception:
+        return False
+
+
+def _load_proxies_values():
+    res = sheets_get(qrange(PROXIES_TAB, "A:ZZ"))
+    return res.get("values", [])
+
+
+def _proxy_cols(values):
+    header = hmap(values)
+    def ci(*names):
+        for n in names:
+            if n.upper() in header:
+                return header[n.upper()]
+        return None
+    return {
+        "ip":           ci("IP"),
+        "port":         ci("PORT"),
+        "status":       ci("STATUS"),
+        "rt":           ci("RESPONSETIME(S)", "RESPONSE TIME(S)", "RESPONSETIME"),
+        "assigned_to":  ci("ASSIGNED_TO"),
+        "assigned_at":  ci("ASSIGNED_AT"),
+        "last_checked": ci("LAST_CHECKED"),
+        "last_ok":      ci("LAST_CHECK_OK"),
+    }
+
+
+def _write_proxy_row(excel_row, cols, updates):
+    """updates: dict of {col-key -> value}; unspecified keys are left
+    untouched. Always goes out as ONE batchUpdate call regardless of how
+    many of the cells changed."""
+    data = []
+    for key, val in updates.items():
+        col = cols.get(key)
+        if col is None:
+            continue
+        data.append({"range": qrange(PROXIES_TAB, f"{col_letter(col)}{excel_row}"), "values": [[val]]})
+    if data:
+        sheets_batch_update_values(data)
+
+
+def _find_proxy_row(ip, port):
+    """Returns (excel_row, cols, values) for the Proxies row matching
+    ip/port, or (None, None, None) if not found. Returning the already-
+    loaded `values` array lets callers read any field (e.g. ASSIGNED_TO)
+    without an extra Sheets round trip."""
+    values = _load_proxies_values()
+    cols = _proxy_cols(values)
+    if cols["ip"] is None:
+        return None, None, None
+    for excel_row in range(2, len(values) + 1):
+        if cell(values, excel_row, cols["ip"]) == ip and cell(values, excel_row, cols["port"]) == port:
+            return excel_row, cols, values
+    return None, None, None
+
+
+def _proxy_owned_by(ip, port, handle):
+    """True only if the Proxies tab currently shows THIS handle as the
+    ASSIGNED_TO owner of ip:port. Used to catch the case where an account's
+    Credentials row still has a PROXY_IP/PROXY_PORT on file that either
+    never got recorded as "assigned" (stale data from before ASSIGNED_TO
+    existed) or has since been claimed by a different account — in either
+    case this account must NOT keep reusing it, since that would mean two
+    accounts sharing one proxy."""
+    excel_row, cols, values = _find_proxy_row(ip, port)
+    if excel_row is None or cols["assigned_to"] is None:
+        return False
+    assigned_to = cell(values, excel_row, cols["assigned_to"])
+    if not assigned_to:
+        return False
+    return assigned_to.strip().lower() == handle.strip().lower()
+
+
+def touch_proxy_alive(ip, port):
+    """Update LAST_CHECKED/LAST_CHECK_OK for an already-assigned proxy
+    that just passed its liveness check, without touching its assignment."""
+    excel_row, cols, _values = _find_proxy_row(ip, port)
+    if excel_row is None:
+        return
+    _write_proxy_row(excel_row, cols, {"last_checked": _now_str(), "last_ok": "alive"})
+
+
+def release_or_kill_proxy(ip, port, alive):
+    """alive=False: mark the proxy 'dead' so it's never handed out again.
+    alive=True: release it back to the free pool (e.g. its account got
+    banned and no longer needs it) so another account can claim it."""
+    excel_row, cols, _values = _find_proxy_row(ip, port)
+    if excel_row is None:
+        return
+    now = _now_str()
+    if alive:
+        _write_proxy_row(excel_row, cols, {
+            "status": "", "assigned_to": "", "assigned_at": "",
+            "last_checked": now, "last_ok": "alive",
+        })
+    else:
+        _write_proxy_row(excel_row, cols, {
+            "status": "dead", "last_checked": now, "last_ok": "dead",
+        })
+
+
+def _claim_proxy_row(cols, excel_row, handle):
+    """Optimistic claim: re-read the Status cell (and ASSIGNED_TO, as a
+    fallback if there's no Status column) fresh right before writing, to
+    narrow (not fully eliminate) the race between two account jobs
+    claiming the same proxy row at once — same pattern as claim_url_row()
+    for LinkPlan rows elsewhere in this file."""
+    if cols["status"] is not None:
+        rng = qrange(PROXIES_TAB, f"{col_letter(cols['status'])}{excel_row}")
+        fresh = sheets_get(rng)
+        rows = fresh.get("values", [])
+        current = str(rows[0][0]).strip().lower() if rows and rows[0] else ""
+        if current in ("assigned", "dead"):
+            return False
+    elif cols["assigned_to"] is not None:
+        rng = qrange(PROXIES_TAB, f"{col_letter(cols['assigned_to'])}{excel_row}")
+        fresh = sheets_get(rng)
+        rows = fresh.get("values", [])
+        current = str(rows[0][0]).strip() if rows and rows[0] else ""
+        if current:
+            return False
+
+    now = _now_str()
+    _write_proxy_row(excel_row, cols, {
+        "status": "assigned", "assigned_to": handle, "assigned_at": now,
+        "last_checked": now, "last_ok": "alive",
+    })
+    return True
+
+
+def find_and_claim_free_proxy(handle, timeout):
+    """Scan the Proxies tab for a free (not assigned, not dead) proxy,
+    fastest ResponseTime(s) first, live-check each candidate, and claim
+    the first one that's actually alive. Dead candidates encountered along
+    the way are marked 'dead' so future cycles skip them immediately."""
+    values = _load_proxies_values()
+    if not values or len(values) < 2:
+        return None
+    cols = _proxy_cols(values)
+    if cols["ip"] is None or cols["port"] is None:
+        print(f"Warning: '{PROXIES_TAB}' needs at least IP and Port columns.")
+        return None
+
+    candidates = []
+    for excel_row in range(2, len(values) + 1):
+        ip = cell(values, excel_row, cols["ip"])
+        port = cell(values, excel_row, cols["port"])
+        if not ip or not port:
+            continue
+        status = cell(values, excel_row, cols["status"]).lower() if cols["status"] else ""
+        last_ok = cell(values, excel_row, cols["last_ok"]).lower() if cols["last_ok"] else ""
+        assigned_to = cell(values, excel_row, cols["assigned_to"]).strip() if cols["assigned_to"] else ""
+        # Belt-and-suspenders: honor Status if present, but ALSO skip a row
+        # if LAST_CHECK_OK says "dead" or ASSIGNED_TO is already filled in —
+        # this way a missing/deleted Status column can't cause a dead or
+        # already-claimed proxy to look free.
+        if status in ("assigned", "dead"):
+            continue
+        if last_ok == "dead":
+            continue
+        if assigned_to:
+            continue
+        rt = 999.0
+        if cols["rt"]:
+            raw_rt = cell(values, excel_row, cols["rt"])
+            try:
+                rt = float(raw_rt) if raw_rt else 999.0
+            except ValueError:
+                rt = 999.0
+        candidates.append((rt, excel_row, ip, port))
+
+    candidates.sort(key=lambda t: t[0])
+
+    for _, excel_row, ip, port in candidates:
+        if check_proxy_alive(ip, port, timeout):
+            if _claim_proxy_row(cols, excel_row, handle):
+                print(f"Claimed proxy {ip}:{port} for {handle}.")
+                return ip, port
+            print(f"Lost claim race on proxy {ip}:{port} — trying next candidate.")
+            continue
+        _write_proxy_row(excel_row, cols, {"status": "dead", "last_checked": _now_str(), "last_ok": "dead"})
+        print(f"Proxy {ip}:{port} failed liveness check — marked dead, trying next candidate.")
+
+    return None
+
+
+def _write_account_proxy(ip, port):
+    global _account_config
+    core = load_core_data(force=True)
+    header = hmap(core["creds"])
+    ip_col   = header.get("PROXY_IP")
+    port_col = header.get("PROXY_PORT")
+    at_col   = header.get("PROXY_ASSIGNED_AT")
+    if ip_col is None or port_col is None:
+        print(f"Warning: '{CREDS_TAB}' needs PROXY_IP and PROXY_PORT columns to "
+              f"persist the proxy assignment across cycles.")
+        return
+    excel_row = ACCOUNT_ROW + 1
+    data = [
+        {"range": qrange(CREDS_TAB, f"{col_letter(ip_col)}{excel_row}"), "values": [[ip]]},
+        {"range": qrange(CREDS_TAB, f"{col_letter(port_col)}{excel_row}"), "values": [[port]]},
+    ]
+    if at_col is not None:
+        data.append({"range": qrange(CREDS_TAB, f"{col_letter(at_col)}{excel_row}"), "values": [[_now_str()]]})
+    sheets_batch_update_values(data)
+    if _account_config:
+        _account_config["proxy_ip"] = ip
+        _account_config["proxy_port"] = port
+
+
+def _clear_account_proxy():
+    global _account_config
+    core = load_core_data(force=True)
+    header = hmap(core["creds"])
+    ip_col   = header.get("PROXY_IP")
+    port_col = header.get("PROXY_PORT")
+    if ip_col is None or port_col is None:
+        return
+    excel_row = ACCOUNT_ROW + 1
+    sheets_batch_update_values([
+        {"range": qrange(CREDS_TAB, f"{col_letter(ip_col)}{excel_row}"), "values": [[""]]},
+        {"range": qrange(CREDS_TAB, f"{col_letter(port_col)}{excel_row}"), "values": [[""]]},
+    ])
+    if _account_config:
+        _account_config["proxy_ip"] = ""
+        _account_config["proxy_port"] = ""
+
+
+def ensure_account_proxy(cfg):
+    """Called once per cycle, right before login. Keeps the account on its
+    previously-assigned proxy as long as it's alive; otherwise kills it and
+    claims a fresh, not-yet-used one. Returns an 'http://ip:port' proxy URL,
+    or None if proxies are disabled (USE_PROXY=false)."""
+    if not cfg.get("use_proxy", True):
+        return None
+
+    handle  = cfg["handle"]
+    timeout = cfg.get("proxy_check_timeout", 10)
+
+    ip, port = cfg.get("proxy_ip", ""), cfg.get("proxy_port", "")
+    if ip and port:
+        if not _proxy_owned_by(ip, port, handle):
+            # Either stale data (this account's Credentials row still
+            # points at a proxy that was never actually recorded as
+            # "assigned" to it) or the proxy has since been claimed by a
+            # different account. Either way: this account must NOT keep
+            # using it — that would mean two accounts sharing one proxy.
+            print(f"Proxy {ip}:{port} on file for {handle} is not exclusively assigned to "
+                  f"this account in '{PROXIES_TAB}' — clearing the stale record and "
+                  f"claiming a fresh, unshared proxy instead.")
+            _clear_account_proxy()
+        elif check_proxy_alive(ip, port, timeout):
+            touch_proxy_alive(ip, port)
+            print(f"Reusing existing proxy {ip}:{port} for {handle} (still alive).")
+            return _http_proxy_url(ip, port)
+        else:
+            print(f"Assigned proxy {ip}:{port} for {handle} is dead — releasing it and picking a new one.")
+            release_or_kill_proxy(ip, port, alive=False)
+            _clear_account_proxy()
+
+    claimed = find_and_claim_free_proxy(handle, timeout)
+    if claimed is None:
+        if cfg.get("proxy_required", True):
+            raise NoProxyAvailableError(
+                f"No live, unused proxy available in '{PROXIES_TAB}' for {handle}."
+            )
+        print("No proxy available and PROXY_REQUIRED is false — continuing without a proxy.")
+        return None
+
+    ip, port = claimed
+    _write_account_proxy(ip, port)
+    return _http_proxy_url(ip, port)
+
+
+class ProxyClientBuildError(Exception):
+    """Raised when a proxy was assigned/required but could not actually be
+    attached to the atproto Client. Callers must treat this as a hard stop
+    for the cycle (no login, no post) — never as a reason to fall back to
+    posting without a proxy."""
+
+
+def build_bsky_client(proxy_url):
+    """Create the atproto Client, routed through `proxy_url` if given.
+
+    IMPORTANT: atproto's Client(base_url=None, *args, **kwargs) looks like
+    it forwards kwargs to httpx, but it doesn't — ClientBase.__init__ only
+    accepts (base_url, request). Passing Client(proxy=...) or
+    Client(proxies=...) directly raises TypeError (silently swallowed by a
+    naive try/except, which is how a previous version of this function
+    ended up building an UNPROXIED client and posting through it anyway).
+
+    The correct way is to build the underlying Request object yourself —
+    Request(**kwargs) forwards straight into httpx.Client(**kwargs) — and
+    hand that pre-built Request to Client(request=...).
+    """
+    if not proxy_url:
+        return Client()
+
+    last_exc = None
+    for kwargs in (
+        {"proxy": proxy_url},                                          # httpx >= 0.26
+        {"proxies": {"http://": proxy_url, "https://": proxy_url}},     # older httpx
+    ):
+        try:
+            req = AtprotoRequest(**kwargs)
+            return Client(request=req)
+        except TypeError as exc:
+            last_exc = exc
+            continue
+
+    raise ProxyClientBuildError(
+        f"Could not configure HTTP proxy {proxy_url!r} on the atproto Client "
+        f"with the installed httpx/atproto version ({last_exc})."
+    )
+
+
+def _looks_like_proxy_error(exc):
+    """Heuristic: does this exception look like it came from the proxy
+    itself being unreachable/broken, rather than a real Bluesky API error
+    (bad credentials, account takedown, etc.)?"""
+    text = f"{type(exc).__name__}: {exc}"
+    markers = (
+        "ProxyError", "ConnectError", "ConnectTimeout", "ReadTimeout",
+        "Failed to establish a new connection", "Connection refused",
+        "Cannot connect to proxy", "Tunnel connection failed",
+        "Max retries exceeded", "RemoteProtocolError", "ConnectionResetError",
+    )
+    return any(m in text for m in markers)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  TEXT HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -906,6 +1360,12 @@ def print_config_summary():
               f"last heartbeat={cfg.get('locked_at') or '—'})")
     else:
         print("  Cross-repo lock:          disabled (add LOCKED_BY / LOCKED_AT columns to enable)")
+    print(f"  Proxy usage:              {'enabled' if cfg.get('use_proxy', True) else 'disabled'}"
+          f"{' (required)' if cfg.get('use_proxy', True) and cfg.get('proxy_required', True) else ''}")
+    if cfg.get("use_proxy", True):
+        proxy_display = f"{cfg.get('proxy_ip') or '—'}:{cfg.get('proxy_port') or '—'}"
+        print(f"  Current proxy:            {proxy_display}")
+        print(f"  Proxy check timeout:      {cfg.get('proxy_check_timeout', 10)}s")
     print(f"  Sheets retry budget:      {SHEETS_RETRY_BUDGET_SECONDS}s per call "
           f"(max backoff {SHEETS_MAX_BACKOFF_SECONDS}s)")
     print("─────────────────────────────────────────────────")
@@ -1083,6 +1543,140 @@ def get_account_hashtags():
         return [w.lstrip("#") for w in random.choice(sets).split() if w.startswith("#")] if sets else []
     except FileNotFoundError:
         return []
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  AUTO ADULT / LIVE-CAM CAPTIONS (unique every post, with emojis)
+# ═══════════════════════════════════════════════════════════════════════════
+# Post layout (every media post):
+#
+#   <main body caption with emoji>
+#
+#   💖 <action words> 😘 <rich "Live Models"  OR  plain actual URL>
+#
+#   #hashtag1 #hashtag2 ...
+#
+# Link is ONLY one style per post — never rich + plain together.
+# Main caption is always unique adult/body-focused text.
+
+_CAPTION_EMOJIS = [
+    "🔥", "😈", "💋", "🥵", "💦", "🍑", "🍆", "❤️‍🔥", "😉", "👅",
+    "💃", "🎥", "🔴", "💕", "✨", "👀", "🥰", "😏", "💖", "🌙", "😘",
+]
+
+# Main body captions (unique adult / body / cam style)
+_BODY_CAPTION_TEMPLATES = [
+    "I'm owning my body without a single thread in the way. These nipples are hard and ready for attention. {e}",
+    "No clothes, no rules — just me, bare and waiting. Come closer. {e}",
+    "Soft skin, hard nipples, and a very dirty mind tonight. {e}",
+    "Fully naked and online. My body is yours to look at right now. {e}",
+    "These curves aren't hiding anymore. Want a closer look? {e}",
+    "Bare, wet, and ready for 1-on-1 attention. {e}",
+    "I took everything off just for you. Don't be shy. {e}",
+    "Nipples out, legs open, live and unfiltered. {e}",
+    "No bra, no panties — just me and this cam. {e}",
+    "Feeling extra naughty. My body is on full display. {e}",
+    "Every inch of me is online right now. Come watch. {e}",
+    "Hard nipples and a soft bed. Guess where I am. {e}",
+    "Stripped down and live. Private shows start when you join. {e}",
+    "I'm not wearing a single thing. Your move. {e}",
+    "Body on show, mind in the gutter. Join me live. {e}",
+    "These tits are out and ready for attention. {e}",
+    "Ass up, cam on, waiting for someone fun. {e}",
+    "Naked and bored until you show up. {e}",
+    "Skin only. No filters. Real body, real time. {e}",
+    "I undressed just so you could stare. Enjoy. {e}",
+    "Live, nude, and in the mood. 1-on-1 is open. {e}",
+    "My nipples got hard the second the cam went on. {e}",
+    "Nothing left to the imagination — come see. {e}",
+    "Bare skin and dirty thoughts. Private chat is open. {e}",
+    "Fully exposed and loving every second of it. {e}",
+]
+
+# Action line that sits right before the link: "💖 action words 😘"
+_ACTION_LINE_TEMPLATES = [
+    "Join my private show",
+    "Watch me live now",
+    "Start 1-on-1 chat",
+    "Come play with me",
+    "Enter private cam",
+    "Unlock full access",
+    "See me completely nude",
+    "Join exclusive live",
+    "Open private room",
+    "Chat with me live",
+    "Get the full show",
+    "Watch every inch",
+    "Private nude live",
+    "Come inside now",
+    "Live cam is open",
+    "Tap for more of me",
+    "See what I'm hiding",
+    "Join my OnlyFans",
+    "Full nude content here",
+    "Don't miss this show",
+]
+
+_RICH_LINK_DISPLAY_OPTIONS = [
+    "Live Models",
+    "Live Cam",
+    "1-on-1 Live",
+    "Private Show",
+    "Live Chat",
+    "Join Live",
+    "Watch Live",
+    "Private Cam",
+    "Adult Live",
+    "Live Now",
+    "OnlyFans",
+    "Full Video",
+]
+
+
+def _pick_emoji():
+    return random.choice(_CAPTION_EMOJIS)
+
+
+def generate_body_caption():
+    """Unique main body caption (adult / body focused) with trailing emoji."""
+    tmpl = random.choice(_BODY_CAPTION_TEMPLATES)
+    return tmpl.format(e=_pick_emoji())
+
+
+def generate_action_line():
+    """Action words sandwiched in emojis, e.g. '💖 Join my private show 😘'."""
+    words = random.choice(_ACTION_LINE_TEMPLATES)
+    return f"💖 {words} 😘"
+
+
+def choose_caption_and_link_style(sheet_caption, add_link):
+    """Build the post pieces matching the desired layout.
+
+    Returns:
+      body_caption: str   — main adult body text
+      action_line:  str   — "💖 action words 😘" (empty if no link)
+      link_mode: None | "rich" | "plain"
+      rich_display: str or None
+    """
+    cfg = _cfg()
+    body_caption = generate_body_caption()
+
+    if not add_link:
+        return body_caption, "", None, None
+
+    action_line = generate_action_line()
+    # Exactly one link style: rich display text OR plain actual URL — never both.
+    link_mode = random.choice(["rich", "plain"])
+    rich_display = None
+    if link_mode == "rich":
+        account_display = (cfg.get("link_display_text") or "").strip()
+        bare_url = (cfg.get("link_url") or "").replace("https://", "").replace("http://", "").lower()
+        if account_display and account_display.lower() not in (bare_url, ""):
+            rich_display = account_display if random.random() < 0.55 else random.choice(_RICH_LINK_DISPLAY_OPTIONS)
+        else:
+            rich_display = random.choice(_RICH_LINK_DISPLAY_OPTIONS)
+
+    return body_caption, action_line, link_mode, rich_display
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1514,20 +2108,24 @@ def post_link_card(client, url, caption, tags, timeout, max_thumb_bytes, auto_ca
         print(f"Warning: preview fetch failed ({exc}); posting as plain link instead.")
 
     used_auto_caption = False
-    effective_caption = caption
-    if not effective_caption and preview and auto_caption_enabled:
-        effective_caption = compose_fallback_caption(preview)
-        used_auto_caption = bool(effective_caption)
-        if used_auto_caption:
-            print("No Caption in sheet — using title + description from the preview instead.")
-    elif not effective_caption and preview and not auto_caption_enabled:
+    effective_caption = (caption or "").strip()
+    if effective_caption:
+        effective_caption = _URL_RE.sub("", effective_caption).strip()
+    if not effective_caption and auto_caption_enabled:
+        # Prefer unique adult/live-cam auto caption; fall back to preview title+desc only if disabled.
+        effective_caption = generate_body_caption()
+        used_auto_caption = True
+        print(f"No Caption in sheet — using auto adult caption: {effective_caption!r}")
+    elif not effective_caption and not auto_caption_enabled:
         print("No Caption in sheet and previewLink auto-caption is off — posting without a caption.")
 
+    # For previewLink posts the embed already carries the destination URL, so we
+    # do not also put a rich/plain link in the text (avoids double links).
     tb = build_link_caption_text(effective_caption, tags, fallback_url=(url if preview is None else None))
     client.send_post(text=tb, embed=embed)
 
     posted_url = preview["final_url"] if preview else url
-    caption_source = "auto (title+description)" if used_auto_caption else ("sheet" if caption else "no")
+    caption_source = "auto (adult/live-cam)" if used_auto_caption else ("sheet" if caption else "no")
     print(f"✓ Posted {'link card' if embed else 'plain link'} for {posted_url} "
           f"(caption={caption_source}, tags={len(tags)})")
 
@@ -1652,31 +2250,39 @@ def release_claim(claimed_name, original_name):
 #  IMAGE/VIDEO POST BUILDING
 # ═══════════════════════════════════════════════════════════════════════════
 
-def build_post_from_caption(caption, tags, add_link):
-    cfg  = _cfg()
-    text = replace_mentions(caption) if caption else ""
+def build_post_from_caption(body_caption, action_line, tags, link_mode=None, rich_display=None):
+    """Build rich-text post in the exact layout:
+
+        <body caption>
+
+        💖 action words 😘 <rich link OR plain URL>
+
+        #hashtags...
+    """
+    cfg = _cfg()
+    text = replace_mentions(body_caption) if body_caption else ""
+    text = _URL_RE.sub("", text).strip() if text else ""
 
     def _assemble(caption_text):
         tb = TextBuilder()
-        if add_link:
-            m = _URL_RE.search(caption_text)
-            if m:
-                before = caption_text[:m.start()].rstrip()
-                after  = _URL_RE.sub("", caption_text[m.end():]).strip()
-                if before:
-                    tb.text(before + " ")
-                tb.link(cfg["link_display_text"], cfg["link_url"])
-                if after:
-                    tb.text(" " + after)
+        if caption_text:
+            tb.text(caption_text)
+
+        # Action line + single CLICKABLE link (never plain non-clickable text).
+        # Both modes use app.bsky.richtext.facet#link via TextBuilder.link():
+        #   "rich"  → custom anchor text (e.g. "Live Models") → URL
+        #   "plain" → URL text itself is the clickable link     → URL
+        if link_mode in ("rich", "plain"):
+            tb.text("\n\n")
+            if action_line:
+                tb.text(action_line + " ")
+            url = cfg["link_url"]
+            if link_mode == "rich":
+                display = (rich_display or cfg.get("link_display_text") or "Live Models").strip()
+                tb.link(display, url)
             else:
-                if caption_text:
-                    tb.text(caption_text)
-                    tb.text("\n\n")
-                tb.link(cfg["link_display_text"], cfg["link_url"])
-        else:
-            text_no_url = _URL_RE.sub("", caption_text).strip()
-            if text_no_url:
-                tb.text(text_no_url)
+                # URL string is both the visible text and the destination — real facet link
+                tb.link(url, url)
 
         if tags:
             tb.text("\n\n")
@@ -1686,13 +2292,13 @@ def build_post_from_caption(caption, tags, add_link):
                     tb.text(" ")
         return tb
 
-    tb    = _assemble(text)
+    tb = _assemble(text)
     plain = tb.build_text()
 
     if len(plain) > MAX_POST_GRAPHEMES:
         lo, hi, best_text = 0, len(text), ""
         while lo <= hi:
-            mid   = (lo + hi) // 2
+            mid = (lo + hi) // 2
             trial = text[:mid].rstrip()
             if mid < len(text):
                 trial += "…"
@@ -1709,7 +2315,11 @@ def build_post_from_caption(caption, tags, add_link):
 
 
 def post_to_bluesky(client, media_name, local_path, kind, caption, tags, add_link):
-    tb = build_post_from_caption(caption, tags, add_link)
+    body_caption, action_line, link_mode, rich_display = choose_caption_and_link_style(caption, add_link)
+    tb = build_post_from_caption(
+        body_caption, action_line, tags,
+        link_mode=link_mode, rich_display=rich_display,
+    )
     if kind == "video":
         with open(local_path, "rb") as f:
             client.send_video(text=tb, video=f.read(), video_alt=media_name)
@@ -1717,18 +2327,14 @@ def post_to_bluesky(client, media_name, local_path, kind, caption, tags, add_lin
         with open(local_path, "rb") as f:
             client.send_image(text=tb, image=f.read(), image_alt=media_name)
 
-    preview = replace_mentions(caption or "")
-    if add_link:
-        m = _URL_RE.search(preview)
-        if m:
-            preview = (preview[:m.start()].rstrip()
-                       + f" [{_cfg()['link_display_text']}]"
-                       + _URL_RE.sub("", preview[m.end():]).strip())
-        else:
-            preview = (preview + f" [{_cfg()['link_display_text']}]").strip()
-    else:
-        preview = _URL_RE.sub("", preview).strip()
-    print(f"✓ Posted {kind}: {preview!r} (link={'yes' if add_link else 'no'})")
+    link_info = "no"
+    if link_mode == "rich":
+        link_info = f"rich[{rich_display}]"
+    elif link_mode == "plain":
+        link_info = "plain-url"
+    print(f"✓ Posted {kind}: {body_caption!r}")
+    if action_line:
+        print(f"  Action: {action_line} → {link_info}")
     if tags:
         print(f"  Tags: {' '.join('#'+t for t in tags)}")
 
@@ -1828,12 +2434,31 @@ def run_once():
 
     handle = cfg["handle"]
 
+    # Get (or keep) a live proxy for this account before doing anything else.
+    proxy_url = ensure_account_proxy(cfg)
+    cfg = _cfg()   # pick up any proxy_ip/proxy_port just written to the cache
+
     print_target_account(handle)
-    client = Client()
+    try:
+        client = build_bsky_client(proxy_url)
+    except ProxyClientBuildError as exc:
+        # A proxy was required/assigned but couldn't actually be attached
+        # to the HTTP client — do NOT fall back to an unproxied client.
+        # Skip this cycle entirely; nothing gets logged in or posted.
+        raise NoProxyAvailableError(str(exc)) from exc
+
     try:
         client.login(handle, cfg["app_pw"])
     except Exception as exc:
         err = str(exc)
+        if proxy_url and _looks_like_proxy_error(exc):
+            ip, port = cfg.get("proxy_ip", ""), cfg.get("proxy_port", "")
+            if ip and port:
+                release_or_kill_proxy(ip, port, alive=False)
+                _clear_account_proxy()
+            print(f"Login failed through proxy {proxy_url} — marked dead; "
+                  f"a new proxy will be picked next cycle: {exc}")
+            raise
         if "AccountTakedown" in err or "AccountSuspended" in err:
             raise AccountTakenDownError(f"Account {handle} taken down/suspended.") from exc
         if "AuthenticationRequired" in err or "Invalid identifier or password" in err:
@@ -1937,6 +2562,8 @@ def main():
 
     try:
         ensure_required_tabs()
+        ensure_extra_columns(CREDS_TAB, ["PROXY_IP", "PROXY_PORT", "PROXY_ASSIGNED_AT"])
+        ensure_extra_columns(PROXIES_TAB, PROXY_TRACKING_COLUMNS)
         ensure_settings_defaults()
         ACCOUNT_ROW = resolve_account_row()
         load_account_config()
@@ -1956,6 +2583,9 @@ def main():
         except AccountLockedElsewhereError as exc:
             print(f"\n{'='*60}\n{exc}\nSkipping — schedule keeps running.\n{'='*60}\n")
             sys.exit(0)
+        except NoProxyAvailableError as exc:
+            print(f"\n{'='*60}\n{exc}\nSkipping this cycle — schedule keeps running.\n{'='*60}\n")
+            sys.exit(0)
         except NoMediaFoundError as exc:
             print(f"\n{'='*60}\nNO MEDIA: {exc}\nStopping — schedule keeps running.\n{'='*60}\n")
             sys.exit(0)
@@ -1968,6 +2598,11 @@ def main():
             print(f"\n{'='*60}\n{err_str}\n→ {reason}\n{'='*60}\n")
             _write_account_status(reason)
             log_account_problem(handle, status=reason)
+            # This account is done for good — free up its proxy for others.
+            ip, port = (_account_config or {}).get("proxy_ip", ""), (_account_config or {}).get("proxy_port", "")
+            if ip and port:
+                release_or_kill_proxy(ip, port, alive=True)
+                _clear_account_proxy()
             with open("ACCOUNT_BANNED", "w") as f:
                 f.write(f"{handle}: {reason}\n")
             sys.exit(1)
