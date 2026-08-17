@@ -109,10 +109,12 @@ import ssl
 import subprocess
 import sys
 import time
+import traceback
 import uuid
 from datetime import datetime
 from urllib.parse import urljoin
 
+import grapheme          # NEW – correct Bluesky grapheme counting
 import requests
 from bs4 import BeautifulSoup
 from atproto import Client, models
@@ -1281,6 +1283,11 @@ def build_bsky_client(proxy_url):
     ):
         try:
             req = AtprotoRequest(**kwargs)
+            # Give slow connections / large video uploads more breathing room
+            try:
+                req._client.timeout = 120.0
+            except Exception:
+                pass
             return Client(request=req)
         except TypeError as exc:
             last_exc = exc
@@ -2035,6 +2042,13 @@ def _compress_link_thumb(data, max_bytes):
 
 
 MAX_POST_GRAPHEMES = 300
+SAFETY_MARGIN = 5   # leave a few graphemes of headroom for Bluesky's stricter counting
+
+
+def grapheme_len(s: str) -> int:
+    """Correct Unicode grapheme cluster count (what Bluesky actually enforces)."""
+    return grapheme.length(s)
+
 
 def build_link_caption_text(caption, tags, fallback_url=None):
     text = _URL_RE.sub("", caption or "").strip(" \t\r")
@@ -2053,15 +2067,32 @@ def build_link_caption_text(caption, tags, fallback_url=None):
                 tb.text(" ")
 
     plain = tb.build_text()
-    if len(plain) > MAX_POST_GRAPHEMES:
+    if grapheme_len(plain) > MAX_POST_GRAPHEMES - SAFETY_MARGIN:
         hashtag_block = ("\n\n" + " ".join(f"#{t}" for t in tags)) if tags else ""
-        budget = MAX_POST_GRAPHEMES - len(hashtag_block)
-        trimmed = (text[:max(0, budget - 1)].rstrip() + "…") if budget > 0 else ""
+        budget = MAX_POST_GRAPHEMES - SAFETY_MARGIN - grapheme_len(hashtag_block)
+        # Trim the text part to fit within the remaining budget
+        if budget > 0 and text:
+            # Simple binary search on character positions (good enough)
+            lo, hi, best = 0, len(text), ""
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                trial = text[:mid].rstrip()
+                if mid < len(text):
+                    trial += "…"
+                if grapheme_len(trial) <= budget:
+                    best = trial
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            text = best
+        else:
+            text = ""
+
         tb = TextBuilder()
-        if trimmed:
-            tb.text(trimmed)
+        if text:
+            tb.text(text)
         if tags:
-            if trimmed:
+            if text:
                 tb.text("\n\n")
             for i, tag in enumerate(tags):
                 tb.tag(f"#{tag}", tag)
@@ -2295,19 +2326,19 @@ def build_post_from_caption(body_caption, action_line, tags, link_mode=None, ric
     tb = _assemble(text)
     plain = tb.build_text()
 
-    if len(plain) > MAX_POST_GRAPHEMES:
+    if grapheme_len(plain) > MAX_POST_GRAPHEMES - SAFETY_MARGIN:
         lo, hi, best_text = 0, len(text), ""
         while lo <= hi:
             mid = (lo + hi) // 2
             trial = text[:mid].rstrip()
             if mid < len(text):
                 trial += "…"
-            if len(_assemble(trial).build_text()) <= MAX_POST_GRAPHEMES:
+            if grapheme_len(_assemble(trial).build_text()) <= MAX_POST_GRAPHEMES - SAFETY_MARGIN:
                 best_text = trial
                 lo = mid + 1
             else:
                 hi = mid - 1
-        print(f"Caption too long for post limit ({len(plain)} > {MAX_POST_GRAPHEMES}); "
+        print(f"Caption too long for post limit ({grapheme_len(plain)} graphemes > {MAX_POST_GRAPHEMES}); "
               f"trimmed caption to fit.")
         tb = _assemble(best_text)
 
@@ -2611,7 +2642,8 @@ def main():
             # We deliberately do NOT exit here — the whole point of the retry
             # budget + this catch-all is that a bad cycle (quota, transient
             # network blip, whatever) costs you one cycle, not the account.
-            print(f"Error during cycle: {exc}")
+            print(f"Error during cycle: {type(exc).__name__}: {exc}")
+            traceback.print_exc()          # ← full stack trace now visible in GitHub Actions logs
 
         loop_interval = (_account_config or {}).get("loop_interval_seconds", DEFAULT_LOOP_INTERVAL_SECONDS)
         # Small extra jitter on top of the configured interval so many
