@@ -42,7 +42,7 @@ jobs:
       # --discover mode, so install the full set here too.
       - name: Install dependencies
         run: |
-          pip install google-api-python-client google-auth atproto Pillow requests beautifulsoup4
+          pip install google-api-python-client google-auth atproto Pillow requests beautifulsoup4 grapheme
 
       - name: Install rclone (media lives on Mega)
         run: |
