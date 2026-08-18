@@ -2283,17 +2283,18 @@ def release_claim(claimed_name, original_name):
 
 def build_post_from_caption(body_caption, action_line, tags, link_mode=None, rich_display=None):
     """
-    Priority order when the post is too long:
-      1. Keep the full body caption (highest priority)
-      2. Drop hashtags
-      3. Drop / shorten the action line
-      4. Only as last resort → trim body caption + add …
+    Priority when the post is too long:
+      1. Keep full body caption (highest priority)
+      2. Keep as many hashtags as possible (drop only the ones that overflow)
+      3. Drop action line if still needed
+      4. Only as last resort → trim body caption
     """
     cfg = _cfg()
     text = replace_mentions(body_caption) if body_caption else ""
     text = _URL_RE.sub("", text).strip() if text else ""
+    tags = tags or []
 
-    def _assemble(caption_text, use_action=True, use_tags=True):
+    def _assemble(caption_text, use_action=True, tag_list=None):
         tb = TextBuilder()
         if caption_text:
             tb.text(caption_text)
@@ -2309,37 +2310,63 @@ def build_post_from_caption(body_caption, action_line, tags, link_mode=None, ric
             else:
                 tb.link(url, url)
 
-        if use_tags and tags:
+        if tag_list:
             tb.text("\n\n")
-            for i, tag in enumerate(tags):
+            for i, tag in enumerate(tag_list):
                 tb.tag(f"#{tag}", tag)
-                if i < len(tags) - 1:
+                if i < len(tag_list) - 1:
                     tb.text(" ")
         return tb
 
-    # ── Try full version first ──────────────────────────────────────────────
-    tb = _assemble(text, use_action=True, use_tags=True)
-    plain = tb.build_text()
-    if grapheme_len(plain) <= MAX_POST_GRAPHEMES - SAFETY_MARGIN:
+    limit = MAX_POST_GRAPHEMES - SAFETY_MARGIN
+
+    # ── 1. Try full version ────────────────────────────────────────────────
+    tb = _assemble(text, use_action=True, tag_list=tags)
+    if grapheme_len(tb.build_text()) <= limit:
         return tb
 
-    # ── 1. Drop hashtags ────────────────────────────────────────────────────
-    tb = _assemble(text, use_action=True, use_tags=False)
-    plain = tb.build_text()
-    if grapheme_len(plain) <= MAX_POST_GRAPHEMES - SAFETY_MARGIN:
-        print("Caption was too long → dropped hashtags to keep full body caption.")
+    # ── 2. Keep full caption + action, reduce hashtags until it fits ───────
+    if tags:
+        # Binary search: find the maximum number of hashtags that still fit
+        lo, hi, best_n = 0, len(tags), 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            trial_tags = tags[:mid]
+            if grapheme_len(_assemble(text, use_action=True, tag_list=trial_tags).build_text()) <= limit:
+                best_n = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+        if best_n > 0:
+            print(f"Caption too long → kept {best_n}/{len(tags)} hashtags to fit limit.")
+            return _assemble(text, use_action=True, tag_list=tags[:best_n])
+
+    # ── 3. Drop action line, keep as many hashtags as possible ─────────────
+    if tags:
+        lo, hi, best_n = 0, len(tags), 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            trial_tags = tags[:mid]
+            if grapheme_len(_assemble(text, use_action=False, tag_list=trial_tags).build_text()) <= limit:
+                best_n = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+        if best_n > 0:
+            print(f"Caption too long → dropped action line, kept {best_n}/{len(tags)} hashtags.")
+            return _assemble(text, use_action=False, tag_list=tags[:best_n])
+
+    # ── 4. No hashtags + no action line ────────────────────────────────────
+    tb = _assemble(text, use_action=False, tag_list=[])
+    if grapheme_len(tb.build_text()) <= limit:
+        print("Caption too long → dropped action line and all hashtags.")
         return tb
 
-    # ── 2. Drop action line (keep only the link) ────────────────────────────
-    tb = _assemble(text, use_action=False, use_tags=False)
-    plain = tb.build_text()
-    if grapheme_len(plain) <= MAX_POST_GRAPHEMES - SAFETY_MARGIN:
-        print("Caption was too long → dropped action line to keep full body caption.")
-        return tb
-
-    # ── 3. Last resort: trim body caption ───────────────────────────────────
-    print(f"Caption still too long even after dropping hashtags/action line "
-          f"({grapheme_len(plain)} graphemes). Trimming body caption…")
+    # ── 5. Last resort: trim body caption ──────────────────────────────────
+    print(f"Caption still too long even after dropping hashtags/action "
+          f"({grapheme_len(tb.build_text())} graphemes). Trimming body caption…")
 
     lo, hi, best_text = 0, len(text), ""
     while lo <= hi:
@@ -2347,14 +2374,13 @@ def build_post_from_caption(body_caption, action_line, tags, link_mode=None, ric
         trial = text[:mid].rstrip()
         if mid < len(text):
             trial += "…"
-        if grapheme_len(_assemble(trial, use_action=False, use_tags=False).build_text()) <= MAX_POST_GRAPHEMES - SAFETY_MARGIN:
+        if grapheme_len(_assemble(trial, use_action=False, tag_list=[]).build_text()) <= limit:
             best_text = trial
             lo = mid + 1
         else:
             hi = mid - 1
 
-    return _assemble(best_text, use_action=False, use_tags=False)
-
+    return _assemble(best_text, use_action=False, tag_list=[])
 
 def post_to_bluesky(client, media_name, local_path, kind, caption, tags, add_link):
     body_caption, action_line, link_mode, rich_display = choose_caption_and_link_style(caption, add_link)
