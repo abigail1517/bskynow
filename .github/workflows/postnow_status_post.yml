@@ -107,7 +107,7 @@ jobs:
           python-version: "3.11"
       - name: Install dependencies
         run: |
-          pip install google-api-python-client google-auth atproto Pillow requests beautifulsoup4
+          pip install google-api-python-client google-auth atproto Pillow requests beautifulsoup4 grapheme
       - name: Install rclone
         run: |
           curl https://rclone.org/install.sh | sudo bash
