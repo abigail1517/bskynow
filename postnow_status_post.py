@@ -2282,28 +2282,23 @@ def release_claim(claimed_name, original_name):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def build_post_from_caption(body_caption, action_line, tags, link_mode=None, rich_display=None):
-    """Build rich-text post in the exact layout:
-
-        <body caption>
-
-        💖 action words 😘 <rich link OR plain URL>
-
-        #hashtags...
+    """
+    Priority order when the post is too long:
+      1. Keep the full body caption (highest priority)
+      2. Drop hashtags
+      3. Drop / shorten the action line
+      4. Only as last resort → trim body caption + add …
     """
     cfg = _cfg()
     text = replace_mentions(body_caption) if body_caption else ""
     text = _URL_RE.sub("", text).strip() if text else ""
 
-    def _assemble(caption_text):
+    def _assemble(caption_text, use_action=True, use_tags=True):
         tb = TextBuilder()
         if caption_text:
             tb.text(caption_text)
 
-        # Action line + single CLICKABLE link (never plain non-clickable text).
-        # Both modes use app.bsky.richtext.facet#link via TextBuilder.link():
-        #   "rich"  → custom anchor text (e.g. "Live Models") → URL
-        #   "plain" → URL text itself is the clickable link     → URL
-        if link_mode in ("rich", "plain"):
+        if link_mode in ("rich", "plain") and use_action:
             tb.text("\n\n")
             if action_line:
                 tb.text(action_line + " ")
@@ -2312,10 +2307,9 @@ def build_post_from_caption(body_caption, action_line, tags, link_mode=None, ric
                 display = (rich_display or cfg.get("link_display_text") or "Live Models").strip()
                 tb.link(display, url)
             else:
-                # URL string is both the visible text and the destination — real facet link
                 tb.link(url, url)
 
-        if tags:
+        if use_tags and tags:
             tb.text("\n\n")
             for i, tag in enumerate(tags):
                 tb.tag(f"#{tag}", tag)
@@ -2323,26 +2317,43 @@ def build_post_from_caption(body_caption, action_line, tags, link_mode=None, ric
                     tb.text(" ")
         return tb
 
-    tb = _assemble(text)
+    # ── Try full version first ──────────────────────────────────────────────
+    tb = _assemble(text, use_action=True, use_tags=True)
     plain = tb.build_text()
+    if grapheme_len(plain) <= MAX_POST_GRAPHEMES - SAFETY_MARGIN:
+        return tb
 
-    if grapheme_len(plain) > MAX_POST_GRAPHEMES - SAFETY_MARGIN:
-        lo, hi, best_text = 0, len(text), ""
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            trial = text[:mid].rstrip()
-            if mid < len(text):
-                trial += "…"
-            if grapheme_len(_assemble(trial).build_text()) <= MAX_POST_GRAPHEMES - SAFETY_MARGIN:
-                best_text = trial
-                lo = mid + 1
-            else:
-                hi = mid - 1
-        print(f"Caption too long for post limit ({grapheme_len(plain)} graphemes > {MAX_POST_GRAPHEMES}); "
-              f"trimmed caption to fit.")
-        tb = _assemble(best_text)
+    # ── 1. Drop hashtags ────────────────────────────────────────────────────
+    tb = _assemble(text, use_action=True, use_tags=False)
+    plain = tb.build_text()
+    if grapheme_len(plain) <= MAX_POST_GRAPHEMES - SAFETY_MARGIN:
+        print("Caption was too long → dropped hashtags to keep full body caption.")
+        return tb
 
-    return tb
+    # ── 2. Drop action line (keep only the link) ────────────────────────────
+    tb = _assemble(text, use_action=False, use_tags=False)
+    plain = tb.build_text()
+    if grapheme_len(plain) <= MAX_POST_GRAPHEMES - SAFETY_MARGIN:
+        print("Caption was too long → dropped action line to keep full body caption.")
+        return tb
+
+    # ── 3. Last resort: trim body caption ───────────────────────────────────
+    print(f"Caption still too long even after dropping hashtags/action line "
+          f"({grapheme_len(plain)} graphemes). Trimming body caption…")
+
+    lo, hi, best_text = 0, len(text), ""
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        trial = text[:mid].rstrip()
+        if mid < len(text):
+            trial += "…"
+        if grapheme_len(_assemble(trial, use_action=False, use_tags=False).build_text()) <= MAX_POST_GRAPHEMES - SAFETY_MARGIN:
+            best_text = trial
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    return _assemble(best_text, use_action=False, use_tags=False)
 
 
 def post_to_bluesky(client, media_name, local_path, kind, caption, tags, add_link):
